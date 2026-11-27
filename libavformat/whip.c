@@ -25,6 +25,8 @@
 #include "libavutil/avstring.h"
 #include "libavutil/lfg.h"
 #include "libavutil/opt.h"
+#include "libavutil/bprint.h"
+#include "libavutil/base64.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 #include "libavutil/random_seed.h"
@@ -40,7 +42,78 @@ typedef struct WHIPContext {
     // libdatachannel state
     int pc;
     int *tracks;
+    char **profiles;
 } WHIPContext;
+
+static char* get_h264_sprop_parameter_sets(AVCodecParameters *par) {
+    if (!par->extradata || par->extradata_size < 7)
+        return NULL;
+
+    int num_sps = par->extradata[5] & 0x1F;
+    int pos = 6;
+
+    AVBPrint sps_buf, pps_buf;
+    av_bprint_init(&sps_buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_init(&pps_buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    for (int i = 0; i < num_sps; i++) {
+        if (pos + 2 > par->extradata_size) break;
+        int sps_len = (par->extradata[pos] << 8) | par->extradata[pos+1];
+        pos += 2;
+        if (pos + sps_len > par->extradata_size) break;
+
+        int required_size = (sps_len + 2) / 3 * 4 + 1;
+        char *b64 = av_malloc(required_size);
+        if (b64) {
+            av_base64_encode(b64, required_size, par->extradata + pos, sps_len);
+            if (sps_buf.len > 0) av_bprintf(&sps_buf, ",");
+            av_bprintf(&sps_buf, "%s", b64);
+            av_free(b64);
+        }
+        pos += sps_len;
+    }
+
+    if (pos >= par->extradata_size) {
+        av_bprint_finalize(&sps_buf, NULL);
+        av_bprint_finalize(&pps_buf, NULL);
+        return NULL;
+    }
+
+    int num_pps = par->extradata[pos];
+    pos += 1;
+
+    for (int i = 0; i < num_pps; i++) {
+        if (pos + 2 > par->extradata_size) break;
+        int pps_len = (par->extradata[pos] << 8) | par->extradata[pos+1];
+        pos += 2;
+        if (pos + pps_len > par->extradata_size) break;
+
+        int required_size = (pps_len + 2) / 3 * 4 + 1;
+        char *b64 = av_malloc(required_size);
+        if (b64) {
+            av_base64_encode(b64, required_size, par->extradata + pos, pps_len);
+            if (pps_buf.len > 0) av_bprintf(&pps_buf, ",");
+            av_bprintf(&pps_buf, "%s", b64);
+            av_free(b64);
+        }
+        pos += pps_len;
+    }
+
+    if (sps_buf.len > 0 && pps_buf.len > 0) {
+        int total_len = sps_buf.len + pps_buf.len + 2;
+        char *result = av_malloc(total_len);
+        if (result) {
+            snprintf(result, total_len, "%s,%s", sps_buf.str, pps_buf.str);
+        }
+        av_bprint_finalize(&sps_buf, NULL);
+        av_bprint_finalize(&pps_buf, NULL);
+        return result;
+    }
+
+    av_bprint_finalize(&sps_buf, NULL);
+    av_bprint_finalize(&pps_buf, NULL);
+    return NULL;
+}
 
 static int whip_write_header(AVFormatContext *s)
 {
@@ -63,6 +136,10 @@ static int whip_write_header(AVFormatContext *s)
     // Add tracks based on stream codecs
     whip->tracks = av_calloc(s->nb_streams, sizeof(*whip->tracks));
     if (!whip->tracks)
+        return AVERROR(ENOMEM);
+
+    whip->profiles = av_calloc(s->nb_streams, sizeof(*whip->profiles));
+    if (!whip->profiles)
         return AVERROR(ENOMEM);
 
     av_lfg_init(&lfg, av_get_random_seed());
@@ -90,7 +167,16 @@ static int whip_write_header(AVFormatContext *s)
         switch (st->codecpar->codec_id) {
         case AV_CODEC_ID_H264:
             init.codec    = RTC_CODEC_H264;
-            init.profile  = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+            {
+                char *sprop = get_h264_sprop_parameter_sets(st->codecpar);
+                if (sprop) {
+                    whip->profiles[i] = av_asprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f;sprop-parameter-sets=%s", sprop);
+                    av_free(sprop);
+                } else {
+                    whip->profiles[i] = av_strdup("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
+                }
+                init.profile = whip->profiles[i];
+            }
             st->time_base = (AVRational){1, 90000};
             break;
         case AV_CODEC_ID_H265:
@@ -149,6 +235,8 @@ static int whip_write_header(AVFormatContext *s)
         pinit.payloadType = pt;
         pinit.ssrc       = ssrc;
         pinit.cname      = cname;
+        // Fixes the clockRate occasionally being 0
+        pinit.clockRate  = st->time_base.den / st->time_base.num;
 
         switch (st->codecpar->codec_id) {
         case AV_CODEC_ID_H264:
@@ -249,6 +337,13 @@ static void whip_deinit(AVFormatContext *s)
             }
         }
         av_freep(&whip->tracks);
+    }
+
+    if (whip->profiles) {
+        for (int i = 0; i < s->nb_streams; i++) {
+            av_freep(&whip->profiles[i]);
+        }
+        av_freep(&whip->profiles);
     }
 
     if (whip->pc > 0) {

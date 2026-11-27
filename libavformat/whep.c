@@ -90,6 +90,7 @@ typedef struct WHEPContext {
     AVClass *class;
     char *token;
     char *session_url;
+    char *remote_sdp;
     int64_t pli_period;
     int64_t last_pli_time;
 
@@ -145,6 +146,37 @@ static int whep_get_sdp_a_line(int track, char *buffer, int size, int payload_ty
 
     buffer[0] = '\0';
     return AVERROR(ENOENT);
+}
+
+static int whep_get_remote_sdp_a_line(WHEPContext *whep, int payload_type, char *buffer, int size) {
+    if (!whep->remote_sdp)
+        return AVERROR(ENOENT);
+
+    char search_str[32];
+    snprintf(search_str, sizeof(search_str), "a=fmtp:%d ", payload_type);
+
+    const char *pos = strstr(whep->remote_sdp, search_str);
+    if (!pos) {
+        snprintf(search_str, sizeof(search_str), "a=fmtp:%d", payload_type);
+        pos = strstr(whep->remote_sdp, search_str);
+    }
+
+    if (!pos)
+        return AVERROR(ENOENT);
+
+    const char *end_line = strchr(pos, '\n');
+    if (!end_line)
+        end_line = pos + strlen(pos);
+
+    int len = end_line - pos;
+    if (len > 0 && pos[len-1] == '\r')
+        len--;
+    if (len >= size)
+        len = size - 1;
+
+    memcpy(buffer, pos, len);
+    buffer[len] = '\0';
+    return 0;
 }
 
 static RTPDemuxContext* whep_new_rtp_context(AVFormatContext *s, int payload_type)
@@ -211,12 +243,25 @@ static RTPDemuxContext* whep_new_rtp_context(AVFormatContext *s, int payload_typ
 
         if (handler->parse_sdp_a_line) {
             char line[SDP_MAX_SIZE];
-            int track_id = (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ?
-                          whep->audio_track : whep->video_track;
-            if (whep_get_sdp_a_line(track_id, line, sizeof(line), payload_type) < 0) {
-                av_log(s, AV_LOG_WARNING, "No SDP a-line for payload type %d\n", payload_type);
-            } else {
+            // First, try to get the fmtp line from the REMOTE SDP (server's answer)
+            // This is crucial for H.264/H.265 to receive sprop-parameter-sets (SPS/PPS)
+            if (whep_get_remote_sdp_a_line(whep, payload_type, line, sizeof(line)) == 0) {
+                av_log(s, AV_LOG_DEBUG, "Found remote SDP fmtp line for PT %d: %s\n", payload_type, line);
+                if (strstr(line, "sprop-parameter-sets")) {
+                    av_log(s, AV_LOG_INFO, "SUCCESS: Found sprop-parameter-sets in remote SDP for PT %d\n", payload_type);
+                } else {
+                    av_log(s, AV_LOG_WARNING, "WARNING: No sprop-parameter-sets in remote SDP for PT %d. Decoder may fail if not sent in-band.\n", payload_type);
+                }
                 handler->parse_sdp_a_line(s, st->index, dynamic_protocol_context, line);
+            } else {
+                // Fallback to local track description
+                int track_id = (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ?
+                              whep->audio_track : whep->video_track;
+                if (whep_get_sdp_a_line(track_id, line, sizeof(line), payload_type) == 0) {
+                    handler->parse_sdp_a_line(s, st->index, dynamic_protocol_context, line);
+                } else {
+                    av_log(s, AV_LOG_WARNING, "No SDP a-line for payload type %d\n", payload_type);
+                }
             }
         }
     }
@@ -318,7 +363,17 @@ static int whep_read_header(AVFormatContext *s)
         return AVERROR_EXTERNAL;
     }
 
-    return ff_whip_whep_exchange_and_set_sdp(s, whep->pc, whep->token, &whep->session_url);
+    int ret = ff_whip_whep_exchange_and_set_sdp(s, whep->pc, whep->token, &whep->session_url);
+    if (ret < 0)
+        return ret;
+
+    // Fetch and store the remote SDP answer to extract codec parameters (like SPS/PPS)
+    char remote_sdp_buf[SDP_MAX_SIZE];
+    if (rtcGetRemoteDescription(whep->pc, remote_sdp_buf, sizeof(remote_sdp_buf)) == 0) {
+        whep->remote_sdp = av_strdup(remote_sdp_buf);
+    }
+
+    return 0;
 }
 
 static int whep_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -411,9 +466,24 @@ redo:
 
     // Parse RTP packet
     if (msg->track == whep->audio_track)
-        ret = ff_rtp_parse_packet(rtp_ctx, whep->audio_pkt, (uint8_t **)&msg->data, msg->size) < 0;
+        ret = ff_rtp_parse_packet(rtp_ctx, whep->audio_pkt, (uint8_t **)&msg->data, msg->size);
     else if (msg->track == whep->video_track)
-        ret = ff_rtp_parse_packet(rtp_ctx, whep->video_pkt, (uint8_t **)&msg->data, msg->size) < 0;
+        ret = ff_rtp_parse_packet(rtp_ctx, whep->video_pkt, (uint8_t **)&msg->data, msg->size);
+    else
+        ret = AVERROR(EINVAL);
+
+    // ff_rtp_parse_packet returns:
+    //  0: A complete frame was parsed and is ready in the AVPacket.
+    //  1: More data is needed to complete a frame (do not output yet).
+    // <0: Error.
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "RTP parse error: %d\n", ret);
+        goto redo;
+    }
+    if (ret == 1) {
+        // Need more packets to form a frame, discard this partial data and wait for more
+        goto redo;
+    }
 
     // Send RTCP feedback
     if (avio_open_dyn_buf(&dyn_bc) == 0) {
@@ -446,7 +516,7 @@ redo:
         }
     }
 
-    if (ret != 0)
+    if (ret < 0)
         goto redo;
 
     if (msg->track == whep->audio_track) {
@@ -489,6 +559,9 @@ static int whep_read_close(AVFormatContext *s)
         av_freep(&whep->rtp_ctxs);
         whep->rtp_ctxs_count = 0;
     }
+
+    if (whep->remote_sdp)
+        av_freep(&whep->head);
 
     if (whep->buffer) {
         int head = atomic_load(&whep->head);
